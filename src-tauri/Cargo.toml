@@ -1,6 +1,6 @@
 [package]
 name = "headsup"
-version = "3.2.0"
+version = "3.2.1"
 edition = "2021"
 description = "Always-on-top notifications for the Claude desktop app and Claude Code on Windows"
 license = "MIT"

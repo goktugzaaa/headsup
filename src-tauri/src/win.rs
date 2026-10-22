@@ -3,7 +3,7 @@
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, HANDLE, HWND, STILL_ACTIVE};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, HANDLE, HWND, RECT, STILL_ACTIVE};
 use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetTickCount};
 use windows_sys::Win32::System::Threading::{
@@ -14,8 +14,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowLongPtrW, MessageBoxW, SetForegroundWindow, SetWindowLongPtrW,
-    GWL_EXSTYLE, MB_ICONINFORMATION, MB_OK, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindowVisible, MessageBoxW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GW_HWNDPREV, HWND_NOTOPMOST, HWND_TOPMOST,
+    MB_ICONINFORMATION, MB_OK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
 fn hwnd_of(window: &tauri::WebviewWindow) -> Option<HWND> {
@@ -36,6 +38,58 @@ pub fn ensure_noactivate(window: &tauri::WebviewWindow) {
                 SetWindowLongPtrW(h, GWL_EXSTYLE, wanted);
             }
         }
+    }
+}
+
+/// Put the overlay at the top of the always-on-top band. tao's `set_always_on_top(true)`
+/// does nothing while its flag is already set, but the window can still end up below other
+/// windows with WS_EX_TOPMOST set (seen after hours next to a fullscreen video in a browser),
+/// so the position itself is re-asserted here. `force` first drops and then restores the
+/// flag, which re-inserts a window whose z-order is stuck.
+pub fn raise_topmost(window: &tauri::WebviewWindow, force: bool) {
+    if let Some(h) = hwnd_of(window) {
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+        unsafe {
+            if force {
+                SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+            }
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        }
+    }
+}
+
+/// True when a visible window without WS_EX_TOPMOST is above the overlay in the z-order and
+/// overlaps it: the overlay has lost its always-on-top position.
+pub fn is_buried(window: &tauri::WebviewWindow) -> bool {
+    let Some(h) = hwnd_of(window) else { return false };
+    unsafe {
+        let mut mine: RECT = std::mem::zeroed();
+        if GetWindowRect(h, &mut mine) == 0 {
+            return false;
+        }
+        let mut above = GetWindow(h, GW_HWNDPREV);
+        // Bounded walk: the z-order can change while it is read.
+        for _ in 0..512 {
+            if above.is_null() {
+                return false;
+            }
+            if IsWindowVisible(above) != 0 && IsIconic(above) == 0 {
+                let ex = GetWindowLongPtrW(above, GWL_EXSTYLE) as u32;
+                let mut r: RECT = std::mem::zeroed();
+                let overlaps = GetWindowRect(above, &mut r) != 0
+                    && r.left < mine.right
+                    && r.right > mine.left
+                    && r.top < mine.bottom
+                    && r.bottom > mine.top
+                    && r.right > r.left
+                    && r.bottom > r.top;
+                if overlaps && ex & WS_EX_TOPMOST == 0 {
+                    return true;
+                }
+            }
+            above = GetWindow(above, GW_HWNDPREV);
+        }
+        false
     }
 }
 

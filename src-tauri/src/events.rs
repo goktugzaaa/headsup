@@ -69,8 +69,16 @@ pub fn place_on_cursor_monitor(app: &AppHandle, force: bool) {
 pub fn show_overlay(app: &AppHandle, shared: &Shared) {
     place_on_cursor_monitor(app, false);
     if let Some(w) = window(app) {
-        // Whoever set TOPMOST last wins, so re-assert it on every event.
+        // Whoever set TOPMOST last wins, so re-assert it on every event: tao's flag, and the
+        // z-order itself (tao skips the call while its flag is already set).
+        // Above other always-on-top windows too (a borderless game or player that set TOPMOST
+        // later): the overlay is transparent and click-through, so this covers nothing.
         let _ = w.set_always_on_top(true);
+        let buried = crate::win::is_buried(&w);
+        if buried {
+            util::log_line(&["zorder-restored", "event"]);
+        }
+        crate::win::raise_topmost(&w, buried);
         if !shared.typing.load(Ordering::SeqCst) {
             crate::win::ensure_noactivate(&w);
         }
@@ -1524,12 +1532,30 @@ fn set_capture(app: &AppHandle, shared: &Shared, flag: bool) {
 pub fn start_cursor_poll(app: AppHandle, shared: Arc<Shared>) {
     std::thread::spawn(move || {
         let mut clicks = crate::win::ClickWatch::default();
+        let mut tick: u32 = 0;
+        let mut buried_logged = false;
         loop {
             std::thread::sleep(Duration::from_millis(40));
             if shared.quitting.load(Ordering::SeqCst) {
                 return;
             }
             poll_logo_click(&app, &shared, &mut clicks);
+            // About once a second while something is on screen: a window that went fullscreen
+            // after the banner appeared can end up above the overlay; put it back on top.
+            tick = tick.wrapping_add(1);
+            if tick % 25 == 0 && shared.active_items.load(Ordering::SeqCst) > 0 {
+                if let Some(win) = window(&app) {
+                    if crate::win::is_buried(&win) {
+                        crate::win::raise_topmost(&win, true);
+                        if !buried_logged {
+                            util::log_line(&["zorder-restored"]);
+                            buried_logged = true;
+                        }
+                    } else {
+                        buried_logged = false;
+                    }
+                }
+            }
             let rects = shared.hot_rects.lock().unwrap().clone();
             if rects.is_empty() {
                 set_capture(&app, &shared, false);
