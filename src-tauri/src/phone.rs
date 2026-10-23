@@ -9,7 +9,7 @@ use std::time::Duration;
 pub struct PhoneMsg {
     /// Send now, ignoring the idle rule (remote sessions: the user is away by definition).
     pub urgent: bool,
-    /// "stop" | "permission" | "question" | "limit" | "test"
+    /// "stop" | "permission" | "question" | "limit" (a reset) | "limitHit" (a limit used up) | "test"
     pub kind: &'static str,
     /// Plain text (ntfy, fallback).
     pub text: String,
@@ -62,11 +62,12 @@ fn ntfy_send(server: &str, topic: &str, token: Option<&str>, msg: &PhoneMsg) -> 
     let title = mask::secrets(lines.next().unwrap_or(""));
     let body = mask::secrets(lines.next().unwrap_or(""));
     // ntfy JSON publishing wants a numeric priority (1 min .. 5 max).
-    let priority: u8 = if msg.kind == "permission" || msg.kind == "question" { 4 } else { 3 };
+    let priority: u8 = if matches!(msg.kind, "permission" | "question" | "limitHit") { 4 } else { 3 };
     let tags: Vec<&str> = match msg.kind {
         "permission" => vec!["lock"],
         "question" => vec!["question"],
         "limit" => vec!["orange_circle"],
+        "limitHit" => vec!["no_entry"],
         _ => vec!["white_check_mark"],
     };
     let payload: Value = json!({
@@ -201,7 +202,23 @@ pub fn send_now(shared: &Arc<Shared>, mut msg: PhoneMsg) {
     deliver(shared, msg);
 }
 
+/// An urgent message that is edited later (its buttons answered): `on_sent` gets its Telegram
+/// message id once it is sent.
+pub fn push_tracked(shared: &Arc<Shared>, mut msg: PhoneMsg, on_sent: impl FnOnce(i64) + Send + 'static) {
+    if !config::get_bool(&shared.cfg(), "phone.enabled", true) || !configured(shared) {
+        return;
+    }
+    msg.urgent = true;
+    deliver_with(shared, msg, Some(Box::new(on_sent)));
+}
+
 fn deliver(shared: &Arc<Shared>, msg: PhoneMsg) {
+    deliver_with(shared, msg, None);
+}
+
+type OnSent = Box<dyn FnOnce(i64) + Send>;
+
+fn deliver_with(shared: &Arc<Shared>, msg: PhoneMsg, on_sent: Option<OnSent>) {
     let cfg = shared.cfg();
     let has_telegram = telegram::creds(&cfg).map_or(false, |c| !c.chat_id.is_empty());
     let ntfy_topic = config::get_str(&cfg, "phone.ntfy.topic")
@@ -217,6 +234,9 @@ fn deliver(shared: &Arc<Shared>, msg: PhoneMsg) {
             let html = msg.html.clone().unwrap_or_else(|| esc(&msg.text));
             match telegram::send(&shared, &html, &msg.buttons) {
                 Ok(mid) => {
+                    if let Some(f) = on_sent {
+                        f(mid);
+                    }
                     if let Some(id) = &msg.pending_id {
                         shared.tg_card_msgs.lock().unwrap().insert(mid);
                         shared.tg_msgs.lock().unwrap().insert(mid, (id.clone(), html.clone()));

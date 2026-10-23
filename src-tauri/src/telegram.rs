@@ -810,6 +810,12 @@ fn handle_update(app: &AppHandle, shared: &Arc<Shared>, c: &Creds, u: &Value) {
             return;
         }
         let card_mid = cb.pointer("/message/message_id").and_then(Value::as_i64);
+        // What waits for a usage-limit reset: continue, don't, cancel, send now (schedule.rs).
+        if data.starts_with('l') {
+            let toast = crate::schedule::on_callback(app, shared, data).unwrap_or_default();
+            let _ = api(&c.token, "answerCallbackQuery", &json!({"callback_query_id": cb_id, "text": util::truncate(&toast, 180)}), 10);
+            return;
+        }
         if data.starts_with('r') {
             let toast = crate::remote::on_callback(app, shared, data).unwrap_or_default();
             let _ = api(&c.token, "answerCallbackQuery", &json!({"callback_query_id": cb_id, "text": util::truncate(&toast, 180)}), 10);

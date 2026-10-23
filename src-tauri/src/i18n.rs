@@ -43,6 +43,20 @@ pub struct Strings {
     pub limit_spend: &'static str,
     pub limit_generic: &'static str,
     pub limit_resumed: &'static str,
+    /// A usage limit ran out (limits.rs): the 5-hour, the weekly, a model's ("{model}") or one
+    /// not known.
+    pub limit_hit_five_hour: &'static str,
+    pub limit_hit_seven_day: &'static str,
+    pub limit_hit_model: &'static str,
+    pub limit_hit_generic: &'static str,
+    /// When it resets: "{time}" is local HH:MM, "{date}" dd.mm; `raw` takes Claude Code's own
+    /// wording ("11:30pm (Europe/Istanbul)") when no exact time is known.
+    pub limit_resets_today: &'static str,
+    pub limit_resets_tomorrow: &'static str,
+    pub limit_resets_on: &'static str,
+    pub limit_resets_raw: &'static str,
+    /// "{list}": the projects whose sessions stopped on it.
+    pub limit_waiting: &'static str,
     /// Under the limit-reset logo while it waits for a click (logo.dismiss "anyClick").
     pub logo_hint_any: &'static str,
     /// The same for logo.dismiss "logoClick".
@@ -121,6 +135,15 @@ pub static EN: Strings = Strings {
     limit_spend: "Spend limit reset",
     limit_generic: "Limit reset",
     limit_resumed: "Limit reset · resuming",
+    limit_hit_five_hour: "5-hour limit used up",
+    limit_hit_seven_day: "Weekly limit used up",
+    limit_hit_model: "{model} limit used up",
+    limit_hit_generic: "Usage limit used up",
+    limit_resets_today: "resets at {time}",
+    limit_resets_tomorrow: "resets tomorrow at {time}",
+    limit_resets_on: "resets on {date} at {time}",
+    limit_resets_raw: "resets {text}",
+    limit_waiting: "Waiting: {list}",
     logo_hint_any: "Click anywhere to dismiss",
     logo_hint_logo: "Click the logo to dismiss",
     allow: "Allow",
@@ -205,6 +228,15 @@ pub static TR: Strings = Strings {
     limit_spend: "Harcama limiti yenilendi",
     limit_generic: "Limit yenilendi",
     limit_resumed: "Limit yenilendi · devam ediyor",
+    limit_hit_five_hour: "5 saatlik limit doldu",
+    limit_hit_seven_day: "Haftalık limit doldu",
+    limit_hit_model: "{model} limiti doldu",
+    limit_hit_generic: "Kullanım limiti doldu",
+    limit_resets_today: "yenilenme: {time}",
+    limit_resets_tomorrow: "yenilenme: yarın {time}",
+    limit_resets_on: "yenilenme: {date} {time}",
+    limit_resets_raw: "yenilenme: {text}",
+    limit_waiting: "Bekleyen: {list}",
     logo_hint_any: "Kapatmak için herhangi bir yere tıkla",
     logo_hint_logo: "Kapatmak için logoya tıkla",
     allow: "İzin ver",

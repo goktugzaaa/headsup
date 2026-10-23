@@ -173,7 +173,7 @@ pub fn notify(
 
 /// A banner; `from_claude`: it reports something from Claude (see `icon`).
 #[allow(clippy::too_many_arguments)]
-fn banner(
+pub fn banner(
     app: &AppHandle,
     shared: &Shared,
     from_claude: bool,
@@ -203,6 +203,51 @@ fn banner(
             "sound": config::get_bool(&cfg, "sound", true),
         }),
     );
+}
+
+/// A card with HeadsUp's own buttons (schedule.rs: continue a session when its usage limit
+/// resets). `actions`: (label, what it answers, primary); a click comes back through `answer`
+/// with `{"accept": bool}`. It leaves after `wait_ms` unanswered; `resolve_card` closes it.
+#[allow(clippy::too_many_arguments)]
+pub fn show_offer(
+    app: &AppHandle,
+    shared: &Shared,
+    id: &str,
+    subtitle: &str,
+    body: &str,
+    actions: &[(String, bool, bool)],
+    answered: &str,
+    wait_ms: u64,
+) {
+    let cfg = shared.cfg();
+    let t = shared.t();
+    shared.last_hook_banner_ms.store(util::now_ms(), Ordering::SeqCst);
+    let actions: Vec<Value> = actions.iter().map(|(label, accept, primary)| json!({"label": label, "accept": accept, "primary": primary})).collect();
+    emit(
+        app,
+        shared,
+        "offer",
+        json!({
+            "id": id,
+            "kind": "limit",
+            // It is about a Claude Code session.
+            "icon": icon(&cfg, true),
+            "title": t.code_name,
+            "subtitle": subtitle,
+            "body": body,
+            "actions": actions,
+            "waitMs": wait_ms,
+            "nowLabel": t.now,
+            "closeLabel": close_label(shared),
+            "sound": config::get_bool(&cfg, "sound", true),
+            "labels": {"answered": answered},
+        }),
+    );
+}
+
+/// Close a card on the page (answered here or elsewhere).
+pub fn resolve_card(app: &AppHandle, shared: &Shared, id: &str, answered: bool) {
+    emit_page(app, shared, "resolve", json!({"id": id, "answered": answered}));
 }
 
 /// The limit-reset logo. With logo.dismiss "anyClick" or "logoClick" it stays until clicked
@@ -535,6 +580,8 @@ pub fn handle_event(app: &AppHandle, shared: &Arc<Shared>, kind: &str, event: &V
             event
                 .get("notification_type")
                 .or_else(|| event.get("tool_name"))
+                // StopFailure: the error type.
+                .or_else(|| event.get("error"))
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             &util::project_name(event.get("cwd")),
@@ -575,6 +622,11 @@ pub fn handle_event(app: &AppHandle, shared: &Arc<Shared>, kind: &str, event: &V
         }
         "notification" => {
             let nt = event.get("notification_type").and_then(Value::as_str).unwrap_or("");
+            // Claude Code's own continue at the reset: whether HeadsUp should continue the
+            // session (schedule.rs).
+            if nt.starts_with("quota_auto_resume_") {
+                crate::schedule::on_quota_notice(app, shared, event);
+            }
             if nt == "quota_auto_resume_fired" {
                 if config::get_bool(&cfg, "events.quota_auto_resume_fired", true) {
                     show_logo(app, shared, t.limit_resumed);
@@ -605,6 +657,8 @@ pub fn handle_event(app: &AppHandle, shared: &Arc<Shared>, kind: &str, event: &V
             banner(app, shared, from_claude_code(event), title, &with_project(label, event.get("cwd")), &body, kind, None);
         }
         "status" => handle_status(app, shared, event.get("status").unwrap_or(event)),
+        // The turn ended on an API error (matcher rate_limit): a used-up usage limit?
+        "stopfailure" => crate::limits::on_stop_failure(app, shared, event),
         // A sample of a Claude task-finished banner (titled "Claude"), so it shows the logo such
         // banners get with the current logo.style.
         "test-notify" => banner(
@@ -618,6 +672,8 @@ pub fn handle_event(app: &AppHandle, shared: &Arc<Shared>, kind: &str, event: &V
             None,
         ),
         "test-logo" => show_logo(app, shared, t.limit_five_hour),
+        "test-limit-hit" => crate::limits::test_banner(app, shared),
+        "test-limit-offer" => crate::schedule::test_card(app, shared),
         "reload-config" => reload(app, shared, true),
         "open-settings" => crate::settings::open(app, shared),
         "quit" => quit(app, shared),
@@ -632,7 +688,7 @@ pub fn handle_event(app: &AppHandle, shared: &Arc<Shared>, kind: &str, event: &V
 pub fn reload(app: &AppHandle, shared: &Arc<Shared>, telegram: bool) {
     shared.reload_config();
     if !crate::remote::enabled(shared) {
-        crate::remote::stop_running(app, shared, false);
+        crate::remote::stop_phone_run(app, shared);
         crate::remote::clear_selection(shared);
     }
     // The page needs no config: never hand it the phone token or remote settings. It
@@ -1180,7 +1236,7 @@ pub fn load_state() -> Value {
     st
 }
 
-fn save_state(st: &Value) {
+pub fn save_state(st: &Value) {
     let _ = util::write_json(&util::state_path(), st);
 }
 
@@ -1197,6 +1253,8 @@ fn window_label(shared: &Shared, name: &str) -> &'static str {
 pub fn handle_status(app: &AppHandle, shared: &Arc<Shared>, status: &Value) {
     let Some(rl) = status.get("rate_limits").and_then(Value::as_object) else { return };
     let mut expired: Vec<(String, i64)> = Vec::new();
+    // Windows at 100 % with their reset ahead: that limit is used up (limits.rs).
+    let mut used_up: Vec<(String, i64)> = Vec::new();
     {
         let mut st = shared.state.lock().unwrap();
         if !st.get("windows").map(Value::is_object).unwrap_or(false) {
@@ -1226,15 +1284,23 @@ pub fn handle_status(app: &AppHandle, shared: &Arc<Shared>, status: &Value) {
                 w["usedPercentage"] = json!(0);
             }
             w["resetsAt"] = json!(incoming);
-            if let Some(used) = info.get("used_percentage").and_then(Value::as_f64).filter(|u| (0.0..=100.0).contains(u)) {
+            // A little over 100 % (usage past the limit) counts as 100.
+            let used = info.get("used_percentage").and_then(Value::as_f64).filter(|u| (0.0..=1000.0).contains(u)).map(|u| u.min(100.0));
+            if let Some(used) = used {
                 let cur = w.get("usedPercentage").and_then(Value::as_f64).unwrap_or(0.0);
                 w["usedPercentage"] = json!(used.max(cur));
+                if used >= 100.0 && incoming > now {
+                    used_up.push((name.clone(), incoming));
+                }
             }
         }
         save_state(&st);
     }
     for (name, at) in expired {
         fire_reset(app, shared, &name, at);
+    }
+    for (name, at) in used_up {
+        crate::limits::status_hit(app, shared, &name, at);
     }
 }
 

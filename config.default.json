@@ -18,7 +18,8 @@
     "permission_prompt": true,
     "idle_prompt": false,
     "agent_needs_input": true,
-    "quota_auto_resume_fired": true
+    "quota_auto_resume_fired": true,
+    "limit_hit": true
   },
   "toasts": {
     "enabled": true,
@@ -45,7 +46,7 @@
     "deferWindowMs": 900000,
     "sendUnansweredAfterMs": 60000,
     "holdMs": 480000,
-    "events": { "stop": true, "permission": true, "question": true, "limit": true },
+    "events": { "stop": true, "permission": true, "question": true, "limit": true, "limitHit": true },
     "telegram": { "token": "", "chatId": "" },
     "ntfy": { "server": "https://ntfy.sh", "topic": "", "token": "" }
   },
@@ -56,12 +57,14 @@
     "permissionMode": "default",
     "projects": [],
     "maxRunMinutes": 30,
-    "busyGuardSeconds": 90
+    "busyGuardSeconds": 90,
+    "continueAtReset": true
   },
   "limits": {
     "five_hour": true,
     "seven_day": true,
     "spend_limit": true,
-    "minUsedPercentage": 1
+    "minUsedPercentage": 1,
+    "continueAtReset": "ask"
   }
 }

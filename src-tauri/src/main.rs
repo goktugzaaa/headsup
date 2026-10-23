@@ -10,6 +10,8 @@
 //
 //   4. Remote sessions (remote.rs): the paired Telegram chat can start or continue Claude
 //      Code sessions; the overlay runs `claude -p` headless and relays the result.
+//   5. Usage limits (limits.rs, schedule.rs): a limit used up is reported at once; messages from
+//      the phone wait for the reset, and sessions that stopped on it are continued then.
 //
 // Two windows: the overlay ("main", app/overlay.html) and, on demand, the settings window
 // ("settings", app/settings.html, settings.rs). Each page's commands check which window calls.
@@ -24,9 +26,11 @@ mod hotkey;
 mod http;
 mod i18n;
 mod installer;
+mod limits;
 mod mask;
 mod phone;
 mod remote;
+mod schedule;
 mod settings;
 mod telegram;
 mod tray;
@@ -186,8 +190,13 @@ fn hot_rects(rects: Vec<Rect>, window: tauri::WebviewWindow, shared: State<'_, A
 
 #[tauri::command]
 fn answer(id: String, data: Value, window: tauri::WebviewWindow, app: AppHandle, shared: State<'_, Arc<Shared>>) {
-    if from_overlay(&window) {
-        events::finish_interactive(&app, &shared, &id, Some(data));
+    if !from_overlay(&window) {
+        return;
+    }
+    // A card with HeadsUp's own buttons (continue at a usage-limit reset), not a hook's.
+    match id.strip_prefix("offer-") {
+        Some(item) => schedule::answer_card(&app, &shared, item, data.get("accept").and_then(Value::as_bool) == Some(true)),
+        None => events::finish_interactive(&app, &shared, &id, Some(data)),
     }
 }
 
@@ -575,6 +584,7 @@ fn main() {
             }
             tray::build(&handle, &setup_shared)?;
             events::start_limit_timer(handle.clone(), setup_shared.clone());
+            schedule::start(handle.clone(), setup_shared.clone());
             events::start_toast_listener(handle.clone(), setup_shared.clone());
             events::start_cursor_poll(handle.clone(), setup_shared.clone());
             telegram::start(handle.clone(), setup_shared.clone());

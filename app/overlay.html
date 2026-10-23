@@ -104,6 +104,9 @@
   .banner.permission .app-icon { background: linear-gradient(160deg, #ffd27a, #f0a93b 55%, #d98b1c); }
   .banner.info .app-icon { background: linear-gradient(160deg, #8bb7ff, #5a8def 55%, #3f6fd0); }
   .banner.question .app-icon { background: linear-gradient(160deg, #c9a2ff, #9b6cf0 55%, #7a4fd1); }
+  /* A usage limit used up. */
+  .banner.limit .app-icon { background: linear-gradient(160deg, #ff9b8a, #ec5f4c 55%, #cf4433); }
+  .banner.limit .app-icon .mk-dot { fill: #fff; }
   .banner.question .body, .banner.permission .body { -webkit-line-clamp: 3; color: var(--ink); }
   .banner.permission .body { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
 
@@ -877,6 +880,63 @@
     layoutStack();
   }
 
+  // A card with HeadsUp's own buttons (continue a session when its usage limit resets). The
+  // phone has the same buttons; whichever answers first wins and the host closes the other.
+  // Unanswered, it leaves after `waitMs` (the question stays open on the phone).
+  function showOffer(p) {
+    if (closed.has(String(p.id))) { window.overlay.itemDone(); return; }
+    const el = bannerShell(p, 'interactive');
+    el.dataset.id = p.id;
+    el._labels = p.labels || {};
+    interactive.set(String(p.id), el);
+    setTimeout(reportHotRects, 50);
+    setTimeout(reportHotRects, 700);
+    const c = el.querySelector('.content');
+    if (p.body) c.innerHTML = `<div class="body">${escapeHtml(p.body)}</div>`;
+    else c.remove();
+    const list = Array.isArray(p.actions) ? p.actions : [];
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+    const actions = document.createElement('div');
+    actions.className = list.length === 1 ? 'actions single' : 'actions';
+    for (const a of list) {
+      const b = document.createElement('button');
+      b.className = a.primary ? 'btn primary' : 'btn';
+      b.textContent = a.label || '';
+      b.addEventListener('click', () => answer(p, el, { accept: !!a.accept }));
+      actions.appendChild(b);
+    }
+    panel.appendChild(actions);
+    const foot = document.createElement('div');
+    foot.className = 'panel foot';
+    foot.innerHTML = `<span class="hint"></span><span class="count"></span>`;
+    const bar = document.createElement('div');
+    bar.className = 'progress';
+    el.append(panel, foot, bar);
+    const wait = p.waitMs || 120000;
+    const deadline = Date.now() + wait;
+    el._runBar = () => {
+      const left = Math.max(0, deadline - Date.now());
+      bar.style.transition = 'none';
+      bar.style.transform = `scaleX(${left / wait})`;
+      void bar.offsetWidth;
+      bar.style.transition = `transform ${left}ms linear`;
+      bar.style.transform = 'scaleX(0)';
+    };
+    requestAnimationFrame(el._runBar);
+    const count = foot.querySelector('.count');
+    const tick = () => {
+      if (!count.isConnected || el.classList.contains('answered')) return;
+      const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      count.textContent = left >= 90 ? `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}` : `${left}s`;
+      if (left > 0) el._tick = setTimeout(tick, 250);
+    };
+    tick();
+    if (p.sound) { try { chimeAsk(); } catch {} }
+    el._timer = setTimeout(() => closeCard(el, false), wait);
+    layoutStack();
+  }
+
   function answer(p, el, data) {
     if (el.classList.contains('answered')) return;
     releaseInput(el);
@@ -1087,6 +1147,7 @@
     window.overlay.on('style', applyStyle),
     window.overlay.on('notify', showBanner),
     window.overlay.on('interactive', showInteractive),
+    window.overlay.on('offer', showOffer),
     window.overlay.on('resolve', resolveInteractive),
     window.overlay.on('card-progress', cardProgress),
     window.overlay.on('logo', showLogo),

@@ -45,6 +45,7 @@ const SETTINGS: &[(&str, Kind)] = &[
     ("limits.five_hour", Kind::Bool),
     ("limits.seven_day", Kind::Bool),
     ("limits.spend_limit", Kind::Bool),
+    ("limits.continueAtReset", Kind::OneOf(&["ask", "always", "off"])),
     ("logo.dismiss", Kind::OneOf(&["anyClick", "logoClick", "auto"])),
     ("logo.durationMs", Kind::Int(3_000, 60_000)),
     ("events.stop", Kind::Bool),
@@ -54,6 +55,7 @@ const SETTINGS: &[(&str, Kind)] = &[
     ("events.agent_needs_input", Kind::Bool),
     ("events.idle_prompt", Kind::Bool),
     ("events.quota_auto_resume_fired", Kind::Bool),
+    ("events.limit_hit", Kind::Bool),
     ("toasts.enabled", Kind::Bool),
     ("toasts.watchApps", Kind::Apps),
     ("interactive.enabled", Kind::Bool),
@@ -66,6 +68,7 @@ const SETTINGS: &[(&str, Kind)] = &[
     ("phone.events.permission", Kind::Bool),
     ("phone.events.question", Kind::Bool),
     ("phone.events.limit", Kind::Bool),
+    ("phone.events.limitHit", Kind::Bool),
     ("phone.telegram.token", Kind::Secret),
     ("phone.ntfy.server", Kind::Url),
     ("phone.ntfy.topic", Kind::Topic),
@@ -74,6 +77,7 @@ const SETTINGS: &[(&str, Kind)] = &[
     ("remote.enabled", Kind::Bool),
     ("remote.permissionMode", Kind::OneOf(&["default", "plan", "acceptEdits"])),
     ("remote.maxRunMinutes", Kind::Int(5, 240)),
+    ("remote.continueAtReset", Kind::Bool),
 ];
 
 /// The window is being built (a second request meanwhile is dropped).
@@ -391,6 +395,7 @@ pub fn action(app: &AppHandle, shared: &Arc<Shared>, name: &str) -> Result<(), S
     match name {
         "test_banner" => tray("test_notify"),
         "test_logo" => tray("test_logo"),
+        "test_limit_offer" => events::handle_event(app, shared, "test-limit-offer", &json!({})),
         "phone_test" => tray("phone_test"),
         "pairing_code" => tray("phone_pair"),
         "open_config" => tray("open_config"),
@@ -442,6 +447,9 @@ mod tests {
         // Canonical spelling only.
         assert!(ok(json!({"logo.dismiss": "logoclick"})).is_err());
         assert!(ok(json!({"remote.permissionMode": "bypassPermissions"})).is_err());
+        assert!(ok(json!({"limits.continueAtReset": "always"})).is_ok());
+        assert!(ok(json!({"limits.continueAtReset": "Always"})).is_err());
+        assert!(ok(json!({"remote.continueAtReset": false})).is_ok());
         assert_eq!(ok(json!({"hotkeys.hide": " ctrl+alt+f9 "})).unwrap(), vec![("hotkeys.hide".to_string(), json!("Ctrl+Alt+F9"))]);
         assert_eq!(ok(json!({"hotkeys.hide": ""})).unwrap(), vec![("hotkeys.hide".to_string(), json!(""))]);
         assert!(ok(json!({"hotkeys.hide": "H"})).is_err());

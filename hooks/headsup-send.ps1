@@ -1,4 +1,4 @@
-# Usage: powershell -File headsup-send.ps1 <stop|notification|test-notify|test-logo|reload-config|quit>
+# Usage: powershell -File headsup-send.ps1 <stop|notification|stopfailure|question|permission|test-notify|test-logo|reload-config|quit>
 # Forwards the Claude Code hook JSON from stdin to the overlay; starts the overlay if needed.
 param([string]$Type = 'stop')
 
@@ -18,6 +18,18 @@ if ($cfg -and $cfg.port) { $port = [int]$cfg.port }
 $raw = ''
 try { if ([Console]::IsInputRedirected) { $raw = [Console]::In.ReadToEnd() } } catch {}
 if (-not $raw -or -not $raw.Trim()) { $raw = '{}' }
+# StopFailure: who runs the session (cli, claude-desktop, sdk-cli) is only in the environment;
+# it goes in as "headsup_entrypoint" (letters, digits and - only, so it never needs escaping).
+if ($Type -eq 'stopfailure') {
+    $ep = ([string]$env:CLAUDE_CODE_ENTRYPOINT) -replace '[^A-Za-z0-9-]', ''
+    $t = $raw.Trim()
+    if ($ep -and $t.StartsWith('{')) {
+        $rest = $t.Substring(1).TrimStart()
+        $sep = ','
+        if ($rest.StartsWith('}')) { $sep = '' }
+        $raw = '{"headsup_entrypoint":"' + $ep + '"' + $sep + $rest
+    }
+}
 $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
 
 # Interactive types (question, permission) block until the user clicks a button on the

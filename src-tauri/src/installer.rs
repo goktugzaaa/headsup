@@ -6,7 +6,12 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 /// Bump when the set of hooks changes so existing installs re-run the installer.
-pub const INSTALL_VERSION: u64 = 8;
+/// 9: StopFailure (rate_limit) and the quota_auto_resume_stale / _disabled notifications.
+pub const INSTALL_VERSION: u64 = 9;
+/// Notification types the Notification hook is sent: Claude Code's own continue-at-reset reports
+/// all three quota_auto_resume_* (only _fired shows anything; the others are logged).
+const NOTIFICATION_MATCHER: &str =
+    "permission_prompt|idle_prompt|agent_needs_input|quota_auto_resume_fired|quota_auto_resume_stale|quota_auto_resume_disabled";
 /// Our hook scripts as every version wrote them into settings.json (always with forward
 /// slashes): the %APPDATA% copy (or a repo checkout), the old Electron build's resources
 /// folder, and our exact script names in any other `hooks` folder (an Electron dev run from
@@ -287,8 +292,17 @@ fn install_with(explicit: bool) -> Result<Vec<String>, String> {
         &mut settings,
         "Notification",
         json!({
-            "matcher": "permission_prompt|idle_prompt|agent_needs_input|quota_auto_resume_fired",
+            "matcher": NOTIFICATION_MATCHER,
             "hooks": [{"type": "command", "command": ps_command(&send, Some("notification")), "timeout": 15}]
+        }),
+    );
+    // A turn that ended on a rate-limit error: a used-up usage limit is reported (limits.rs).
+    push_hook(
+        &mut settings,
+        "StopFailure",
+        json!({
+            "matcher": "rate_limit",
+            "hooks": [{"type": "command", "command": ps_command(&send, Some("stopfailure")), "timeout": 15}]
         }),
     );
     // Interactive: the hook waits up to interactive.waitMs for a click on the overlay and
@@ -1138,9 +1152,11 @@ mod tests {
         // Claude Overlay 2.x's hook and ours are both stripped; the user's own stay.
         let old = "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/u/AppData/Roaming/claude-notification/hooks/claude-overlay-send.ps1\" stop";
         let ours = "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/u/AppData/Roaming/HeadsUp/hooks/headsup-send.ps1\" permission";
+        let failure = ps_command(Path::new("C:\\Users\\u\\.headsup\\hooks\\headsup-send.ps1"), Some("stopfailure"));
         let mut s = json!({"hooks": {
             "Stop": [{"hooks": [{"type": "command", "command": old}, {"type": "command", "command": "my-stop.sh"}]}],
             "PermissionRequest": [{"hooks": [{"type": "command", "command": ours}]}],
+            "StopFailure": [{"matcher": "rate_limit", "hooks": [{"type": "command", "command": failure}]}],
             "PreToolUse": [{"matcher": "Bash", "hooks": [
                 {"type": "command", "command": "bash ~/hooks/claude-overlay-mine.sh"},
                 {"type": "command", "command": "bash ~/hooks/headsup-mine.sh"}
@@ -1149,6 +1165,7 @@ mod tests {
         strip_our_hooks(&mut s);
         assert_eq!(s["hooks"]["Stop"], json!([{"hooks": [{"type": "command", "command": "my-stop.sh"}]}]));
         assert!(s["hooks"].get("PermissionRequest").is_none());
+        assert!(s["hooks"].get("StopFailure").is_none());
         assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "bash ~/hooks/claude-overlay-mine.sh");
         assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][1]["command"], "bash ~/hooks/headsup-mine.sh");
         // The 2.x status line wrapper is ours, never the user's original.

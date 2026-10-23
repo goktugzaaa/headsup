@@ -13,6 +13,10 @@
 //! so /stop and the overlay's exit end its whole process tree; nothing runs while the overlay
 //! itself is elevated; one run at a time with a watchdog. Everything sent to the chat is
 //! masked for secrets.
+//!
+//! While a usage limit is used up, a message is not run (it would only fail): it waits for the
+//! reset (schedule.rs), and so does the continue of a run that ended on the limit. Those runs,
+//! and the continues of sessions that stopped on the PC, go through `start` like any other.
 use crate::{config, events, mask, telegram, util, Shared};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -61,6 +65,28 @@ pub enum Target {
     Resume { id: String, cwd: String, project: String, title: String },
 }
 
+/// Who asked for a run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Origin {
+    /// A message from the phone, sent now.
+    Phone,
+    /// A message from the phone that waited for a usage limit to reset.
+    Queued,
+    /// schedule::CONTINUE_PROMPT at a usage-limit reset: a session of a remote run (`pc` false)
+    /// or one that stopped on the PC (`pc` true; it reports to the phone only when the phone is
+    /// set up to answer). Such a run is never continued again when it hits the limit itself.
+    Continue { pc: bool },
+}
+
+/// What `start` did.
+pub enum Start {
+    Started,
+    /// Another run is going on (only the phone is told, for a message from the phone).
+    Busy,
+    /// Not run, and why (already said on the phone where it reports).
+    Refused(String),
+}
+
 pub struct Running {
     pub pid: u32,
     pub seq: u64,
@@ -76,6 +102,8 @@ pub struct Running {
     pub exited: bool,
     /// The run's Job Object (None if it could not be created: taskkill is used then).
     pub job: Option<Arc<Job>>,
+    /// It continues a session of the PC at a usage-limit reset (needs no remote sessions).
+    pub pc_continue: bool,
 }
 
 /// A Job Object holding one run's process tree. With KILL_ON_JOB_CLOSE every process still
@@ -134,8 +162,9 @@ pub struct RemoteState {
     /// Bumped per menu sent; buttons carry it so taps on an old menu are refused.
     pub menu_gen: u64,
     pub running: Option<Running>,
-    /// Prompt held back by the busy guard until the user confirms or cancels: (gen, target, text).
-    pub held: Option<(u64, Target, String)>,
+    /// Prompt held back by the busy guard until the user confirms or cancels: (gen, target, text,
+    /// sent now: Send anyway does not wait for a usage limit either).
+    pub held: Option<(u64, Target, String, bool)>,
     pub held_gen: u64,
     /// session id -> unix ms when our own run on it ended (so the busy guard ignores it).
     pub own_runs: HashMap<String, i64>,
@@ -223,13 +252,16 @@ pub struct S {
     pub cmd_exit: &'static str,
     pub cmd_model: &'static str,
     pub cmd_help: &'static str,
+    /// First line of the status message of a run that waited for a usage limit to reset.
+    pub due_queued: &'static str,
+    pub due_continue: &'static str,
 }
 
 static EN: S = S {
     disabled: "Remote sessions are off. Turn them on from the tray menu: Phone: remote sessions.",
     elevated: "Remote sessions are refused while HeadsUp runs as Administrator. Quit it from the tray and start it again normally.",
     pair_first: "Pair the Telegram chat first: send the pairing code (tray: Phone: show Telegram pairing code) to your bot, then turn remote sessions on.",
-    help: "<b>Remote sessions</b>\n/new: start a new session in a project\n/sessions: pick a recent session; your next message goes there\n/status: what is running\n/stop: stop the running task\n/exit: clear the selected session\n/model [name]: model for remote runs (/model default = your default)\n\nAfter a run, just write to continue the same session. A question or permission card is answered with its buttons, or by replying to that card.",
+    help: "<b>Remote sessions</b>\n/new: start a new session in a project\n/sessions: pick a recent session; your next message goes there\n/status: what is running\n/stop: stop the running task\n/exit: clear the selected session\n/model [name]: model for remote runs (/model default = your default)\n\nAfter a run, just write to continue the same session. A question or permission card is answered with its buttons, or by replying to that card.\n\nWhile a usage limit is used up, a message waits and is sent when the limit resets (/status lists what waits, /stop cancels it).",
     pick_project: "Which project? A new session starts there.",
     no_projects: "No known projects yet: open a project in Claude Code on the PC once.",
     project_chosen: "📁 <b>{p}</b>: new session. Send the task.",
@@ -276,13 +308,15 @@ static EN: S = S {
     cmd_exit: "Clear the selected session",
     cmd_model: "Model for remote runs",
     cmd_help: "Help",
+    due_queued: "⏰ The limit reset: sending your waiting message.",
+    due_continue: "⏰ The limit reset: continuing this session.",
 };
 
 static TR: S = S {
     disabled: "Uzaktan oturum kapalı. Tepsi menüsünden aç: Telefon: uzaktan oturum.",
     elevated: "HeadsUp yönetici olarak çalışırken uzaktan oturum reddedilir. Tepsiden çık ve normal şekilde yeniden başlat.",
     pair_first: "Önce Telegram sohbetini eşleştir: eşleştirme kodunu (tepsi: Telefon: Telegram eşleştirme kodunu göster) botuna gönder, sonra uzaktan oturumu aç.",
-    help: "<b>Uzaktan oturum</b>\n/new: bir projede yeni oturum başlat\n/sessions: son oturumlardan birini seç; sonraki mesajın oraya gider\n/status: ne çalışıyor\n/stop: çalışan görevi durdur\n/exit: seçili oturumu bırak\n/model [ad]: uzaktan çalıştırma modeli (/model default = varsayılanın)\n\nBir çalıştırma bitince yazman yeterli, aynı oturum devam eder. Soru ve izin kartları kendi butonlarıyla ya da o karta yanıt vererek cevaplanır.",
+    help: "<b>Uzaktan oturum</b>\n/new: bir projede yeni oturum başlat\n/sessions: son oturumlardan birini seç; sonraki mesajın oraya gider\n/status: ne çalışıyor\n/stop: çalışan görevi durdur\n/exit: seçili oturumu bırak\n/model [ad]: uzaktan çalıştırma modeli (/model default = varsayılanın)\n\nBir çalıştırma bitince yazman yeterli, aynı oturum devam eder. Soru ve izin kartları kendi butonlarıyla ya da o karta yanıt vererek cevaplanır.\n\nKullanım limiti doluyken mesajın bekler ve limit yenilenince gönderilir (/status bekleyenleri gösterir, /stop iptal eder).",
     pick_project: "Hangi proje? Yeni oturum orada başlar.",
     no_projects: "Henüz bilinen proje yok: bir projeyi PC'de Claude Code ile bir kez aç.",
     project_chosen: "📁 <b>{p}</b>: yeni oturum. Görevi yaz.",
@@ -329,6 +363,8 @@ static TR: S = S {
     cmd_exit: "Seçili oturumu bırak",
     cmd_model: "Uzaktan çalıştırma modeli",
     cmd_help: "Yardım",
+    due_queued: "⏰ Limit yenilendi: bekleyen mesajın gönderiliyor.",
+    due_continue: "⏰ Limit yenilendi: bu oturuma devam ediliyor.",
 };
 
 pub fn s(shared: &Shared) -> &'static S {
@@ -366,12 +402,31 @@ pub fn is_remote_msg(shared: &Shared, mid: i64) -> bool {
     shared.remote.lock().unwrap().msg_ids.contains(&mid)
 }
 
-/// Forget the selected session and any held prompt (remote switched off).
-pub fn clear_selection(shared: &Shared) {
-    let mut st = shared.remote.lock().unwrap();
-    st.target = None;
-    st.target_gen += 1;
-    st.held = None;
+/// Forget the selected session, any held prompt and the messages waiting for a usage-limit
+/// reset (remote switched off).
+pub fn clear_selection(shared: &Arc<Shared>) {
+    {
+        let mut st = shared.remote.lock().unwrap();
+        st.target = None;
+        st.target_gen += 1;
+        st.held = None;
+    }
+    crate::schedule::drop_remote(shared);
+}
+
+/// A run is going on (or finishing).
+pub fn busy(shared: &Shared) -> bool {
+    shared.remote.lock().unwrap().running.is_some()
+}
+
+/// The generation of the phone's target (bumped whenever the user picks another one).
+pub fn target_gen(shared: &Shared) -> u64 {
+    shared.remote.lock().unwrap().target_gen
+}
+
+/// Send to the paired chat as a remote-session message (a reply to it is a prompt).
+pub fn send_msg(shared: &Shared, html: &str, buttons: &[Vec<(String, String)>]) -> Option<i64> {
+    send(shared, html, buttons)
 }
 
 pub fn last_touch_ms(shared: &Shared) -> i64 {
@@ -392,7 +447,7 @@ pub fn has_target_or_run(shared: &Shared) -> bool {
 
 // ---------------------------------------------------------------- discovery
 
-fn claude_config_dir() -> PathBuf {
+pub fn claude_config_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         return PathBuf::from(d);
     }
@@ -471,7 +526,7 @@ fn path_key(p: &str) -> String {
 }
 
 /// (cwd, title) from the head of a transcript: the first real user prompt.
-fn read_head(path: &Path) -> Option<(String, String)> {
+pub fn read_head(path: &Path) -> Option<(String, String)> {
     let f = File::open(path).ok()?;
     let reader = BufReader::new(f.take(3_000_000));
     let mut cwd = String::new();
@@ -575,7 +630,7 @@ pub fn list_projects(cfg: &Value, limit: usize) -> Vec<Project> {
 }
 
 /// Only directories from this list may be used as a working directory.
-fn is_known_project(cfg: &Value, cwd: &str) -> bool {
+pub fn is_known_project(cfg: &Value, cwd: &str) -> bool {
     let key = path_key(cwd);
     list_projects(cfg, 500).iter().any(|p| path_key(&p.cwd) == key)
 }
@@ -596,16 +651,52 @@ pub fn list_sessions(limit: usize) -> Vec<SessionInfo> {
     out
 }
 
-fn transcript_mtime_ms(id: &str) -> Option<i64> {
-    let Ok(dirs) = std::fs::read_dir(projects_root()) else { return None };
-    for d in dirs.flatten() {
-        let p = d.path().join(format!("{id}.jsonl"));
-        if let Ok(m) = std::fs::metadata(&p) {
-            let t = m.modified().ok()?;
-            return Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64);
-        }
+/// The transcript of session `id` (a file name never comes from anywhere but a session id
+/// made of letters, digits and dashes).
+pub fn transcript_path(id: &str) -> Option<PathBuf> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
     }
-    None
+    let dirs = std::fs::read_dir(projects_root()).ok()?;
+    dirs.flatten().map(|d| d.path().join(format!("{id}.jsonl"))).find(|p| p.is_file())
+}
+
+fn transcript_mtime_ms(id: &str) -> Option<i64> {
+    let m = std::fs::metadata(transcript_path(id)?).ok()?;
+    let t = m.modified().ok()?;
+    Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64)
+}
+
+/// How long ago (ms) session `id` changed, when that was after `since_ms`, less than
+/// remote.busyGuardSeconds ago and not through one of our own runs: then it is probably open on
+/// the PC, and a message to it is held for confirmation.
+pub fn changed_since(shared: &Shared, id: &str, since_ms: i64) -> Option<i64> {
+    let guard_ms = config::get_u64(&shared.cfg(), "remote.busyGuardSeconds", 90) as i64 * 1000;
+    let own_end = shared.remote.lock().unwrap().own_runs.get(id).copied();
+    let mtime = transcript_mtime_ms(id)?;
+    let age = util::now_ms() - mtime;
+    let ours = own_end.map(|end| mtime <= end + 15_000).unwrap_or(false);
+    (guard_ms > 0 && age < guard_ms && !ours && mtime > since_ms).then_some(age)
+}
+
+/// Hold `text` for `target` until the user confirms (Send anyway / Cancel): the session changed
+/// `age_ms` ago, so sending now could mix two conversations. `now`: it was sent with Send now, so
+/// Send anyway sends it even while a usage limit is used up.
+pub fn hold_prompt(shared: &Shared, target: Target, text: String, age_ms: i64, now: bool) {
+    let x = s(shared);
+    let gen = {
+        let mut st = shared.remote.lock().unwrap();
+        st.held_gen += 1;
+        let g = st.held_gen;
+        st.held = Some((g, target, text, now));
+        g
+    };
+    let secs = (age_ms / 1000).max(1).to_string();
+    send(
+        shared,
+        &fill(x.active_warn, &[("s", &secs)]),
+        &[vec![(x.send_anyway.to_string(), format!("rf:{gen}")), (x.cancel.to_string(), format!("rx:{gen}"))]],
+    );
 }
 
 // ---------------------------------------------------------------- environment
@@ -829,13 +920,49 @@ pub fn on_command(app: &AppHandle, shared: &Arc<Shared>, text: &str) -> bool {
     }
     util::log_line(&["remote-cmd", &cmd]);
     let x = s(shared);
-    // /stop must always work, even after remote sessions were switched off mid-run.
+    // /stop must always work, even after remote sessions were switched off mid-run. It also
+    // cancels everything that waits for a usage-limit reset.
     if cmd == "/stop" {
+        let mut lines: Vec<String> = Vec::new();
         if stop_running(app, shared, false) {
-            send(shared, x.stopped, &[]);
-        } else {
-            send(shared, x.nothing_running, &[]);
+            lines.push(x.stopped.to_string());
         }
+        let cancelled = crate::schedule::cancel_all(app, shared);
+        if cancelled > 0 {
+            lines.push(crate::schedule::s(shared).stop_cleared.replace("{n}", &cancelled.to_string()));
+        }
+        if lines.is_empty() {
+            lines.push(x.nothing_running.to_string());
+        }
+        send(shared, &lines.join("\n"), &[]);
+        return true;
+    }
+    // /status too: what waits for a limit reset includes sessions of the PC.
+    if cmd == "/status" {
+        let mut lines = Vec::new();
+        if enabled(shared) {
+            let st = shared.remote.lock().unwrap();
+            if let Some(r) = &st.running {
+                let secs = ((util::now_ms() - r.started_ms) / 1000).to_string();
+                lines.push(fill(x.status_running, &[("p", &esc(&r.project)), ("s", &secs)]));
+            }
+            match &st.target {
+                Some(Target::New { project, .. }) => lines.push(fill(x.status_target_new, &[("p", &esc(project))])),
+                Some(Target::Resume { project, title, .. }) => {
+                    lines.push(fill(x.status_target_resume, &[("p", &esc(project)), ("t", &esc(title))]))
+                }
+                None => {}
+            }
+            if lines.is_empty() {
+                lines.push(x.status_idle.to_string());
+            }
+        } else {
+            lines.push(x.disabled.to_string());
+        }
+        lines.extend(crate::limits::status_lines(shared));
+        let (waiting, buttons) = crate::schedule::status(shared);
+        lines.extend(waiting);
+        send(shared, &lines.join("\n"), &buttons);
         return true;
     }
     if !enabled(shared) {
@@ -890,28 +1017,6 @@ pub fn on_command(app: &AppHandle, shared: &Arc<Shared>, text: &str) -> bool {
                     .collect();
                 send(shared, x.pick_session, &buttons);
             }
-        }
-        "/status" => {
-            let lines = {
-                let st = shared.remote.lock().unwrap();
-                let mut lines = Vec::new();
-                if let Some(r) = &st.running {
-                    let secs = ((util::now_ms() - r.started_ms) / 1000).to_string();
-                    lines.push(fill(x.status_running, &[("p", &esc(&r.project)), ("s", &secs)]));
-                }
-                match &st.target {
-                    Some(Target::New { project, .. }) => lines.push(fill(x.status_target_new, &[("p", &esc(project))])),
-                    Some(Target::Resume { project, title, .. }) => {
-                        lines.push(fill(x.status_target_resume, &[("p", &esc(project)), ("t", &esc(title))]))
-                    }
-                    None => {}
-                }
-                if lines.is_empty() {
-                    lines.push(x.status_idle.to_string());
-                }
-                lines
-            };
-            send(shared, &lines.join("\n"), &[]);
         }
         "/exit" => {
             {
@@ -1000,13 +1105,17 @@ pub fn on_callback(app: &AppHandle, shared: &Arc<Shared>, data: &str) -> Option<
             let held = {
                 let mut st = shared.remote.lock().unwrap();
                 match &st.held {
-                    Some((g, _, _)) if *g == gen => st.held.take(),
+                    Some((g, ..)) if *g == gen => st.held.take(),
                     _ => None,
                 }
             };
             match (kind, held) {
-                ("rf", Some((_, target, prompt))) => {
-                    start_run(app, shared, target, prompt);
+                ("rf", Some((_, target, prompt, now))) => {
+                    // A usage limit used up meanwhile: it waits for the reset instead (unless it
+                    // was sent with Send now).
+                    if now || !crate::schedule::queue_if_limited(app, shared, &target, &prompt) {
+                        start_run(app, shared, target, prompt);
+                    }
                     Some(x.send_anyway.to_string())
                 }
                 ("rx", Some(_)) => {
@@ -1048,29 +1157,15 @@ pub fn on_text(app: &AppHandle, shared: &Arc<Shared>, text: &str) -> bool {
         send(shared, x.no_target, &[]);
         return true;
     };
+    // A usage limit used up: the message waits for the reset (the busy guard is checked then).
+    if crate::schedule::queue_if_limited(app, shared, &target, text) {
+        return true;
+    }
     // Busy guard: a session someone is using on the PC right now.
     if let Target::Resume { id, .. } = &target {
-        let guard_ms = config::get_u64(&shared.cfg(), "remote.busyGuardSeconds", 90) as i64 * 1000;
-        let own_end = shared.remote.lock().unwrap().own_runs.get(id).copied();
-        if let Some(mtime) = transcript_mtime_ms(id) {
-            let age = util::now_ms() - mtime;
-            let ours = own_end.map(|end| mtime <= end + 15_000).unwrap_or(false);
-            if guard_ms > 0 && age < guard_ms && !ours {
-                let gen = {
-                    let mut st = shared.remote.lock().unwrap();
-                    st.held_gen += 1;
-                    let g = st.held_gen;
-                    st.held = Some((g, target.clone(), text.to_string()));
-                    g
-                };
-                let secs = (age / 1000).max(1).to_string();
-                send(
-                    shared,
-                    &fill(x.active_warn, &[("s", &secs)]),
-                    &[vec![(x.send_anyway.to_string(), format!("rf:{gen}")), (x.cancel.to_string(), format!("rx:{gen}"))]],
-                );
-                return true;
-            }
+        if let Some(age) = changed_since(shared, id, 0) {
+            hold_prompt(shared, target.clone(), text.to_string(), age, false);
+            return true;
         }
     }
     start_run(app, shared, target, text.to_string());
@@ -1105,8 +1200,9 @@ fn set_user_config(shared: &Shared, key: &str, value: Value) -> bool {
     true
 }
 
-/// Tray toggle. Turning it off always stops a running task and clears the selection, even
-/// when config.json cannot be written (then it stays off for this session in memory).
+/// Tray toggle. Turning it off always stops a running task (not a session of the PC continued
+/// at a limit reset) and clears the selection and the waiting messages, even when config.json
+/// cannot be written (then it stays off for this session in memory).
 pub fn toggle(app: &AppHandle, shared: &Arc<Shared>) -> Toggle {
     let cfg = shared.cfg();
     let currently_on = enabled(shared);
@@ -1125,7 +1221,7 @@ pub fn toggle(app: &AppHandle, shared: &Arc<Shared>) -> Toggle {
         util::log_line(&["remote", "enabled"]);
         return Toggle::On;
     }
-    stop_running(app, shared, false);
+    stop_phone_run(app, shared);
     let written = set_user_config(shared, "enabled", json!(false));
     clear_selection(shared);
     {
@@ -1176,6 +1272,13 @@ pub fn stop_running(app: &AppHandle, shared: &Arc<Shared>, quitting: bool) -> bo
     }
     let _ = quitting; // on quit the process exits right away: no slow network calls here
     true
+}
+
+/// Remote sessions went off: stop the run, unless it continues a session of the PC at a
+/// usage-limit reset (that one does not need them; /stop still stops it).
+pub fn stop_phone_run(app: &AppHandle, shared: &Arc<Shared>) -> bool {
+    let pc = shared.remote.lock().unwrap().running.as_ref().is_some_and(|r| r.pc_continue);
+    !pc && stop_running(app, shared, false)
 }
 
 /// Called when the overlay quits.
@@ -1270,17 +1373,84 @@ fn feed_rate_limits(app: &AppHandle, shared: &Arc<Shared>, v: &Value) {
     }
 }
 
+/// A message from the phone, sent now.
 pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: String) {
+    let gen = target_gen(shared);
+    start(app, shared, target, prompt, Origin::Phone, Some(gen), None);
+}
+
+/// A prompt is held for the user's confirmation (hold_prompt).
+pub fn has_held(shared: &Shared) -> bool {
+    shared.remote.lock().unwrap().held.is_some()
+}
+
+/// remote.model, when it is a valid model name.
+fn configured_model(cfg: &Value) -> Option<String> {
+    config::get_str(cfg, "remote.model").map(|m| m.trim().to_string()).filter(|m| valid_model(m))
+}
+
+/// The model a run uses: remote.model, else the `model` of Claude Code's user settings (what
+/// `claude -p` picks without --model). None when neither names one.
+pub fn run_model(cfg: &Value) -> Option<String> {
+    configured_model(cfg).or_else(|| {
+        util::read_json(&claude_config_dir().join("settings.json"))
+            .and_then(|v| v.get("model").and_then(Value::as_str).map(|m| m.trim().to_string()))
+            .filter(|m| !m.is_empty())
+    })
+}
+
+/// The stricter of two permission modes (plan < default < acceptEdits); one not allowed, or
+/// empty, counts as default.
+fn stricter_mode(a: &str, b: &str) -> String {
+    let rank = |m: &str| match m {
+        "plan" => 0,
+        "acceptEdits" => 2,
+        _ => 1,
+    };
+    match rank(a).min(rank(b)) {
+        0 => "plan",
+        2 => "acceptEdits",
+        _ => "default",
+    }
+    .to_string()
+}
+
+/// A session id that can only be read as one: letters, digits and dashes, not starting with one.
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty() && !id.starts_with('-') && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Run `prompt` for `target`. `target_gen`: the phone's next message goes to this session after
+/// the run, if the user has not picked another target by then (None: the target stays). `cap`:
+/// the permission mode the session stopped in on the PC; the run uses no looser one.
+pub fn start(
+    app: &AppHandle,
+    shared: &Arc<Shared>,
+    target: Target,
+    prompt: String,
+    origin: Origin,
+    target_gen: Option<u64>,
+    cap: Option<&str>,
+) -> Start {
     let x = s(shared);
+    // Where the run reports: the paired chat, except for a session continued for the PC while
+    // the phone is not set up to answer (the PC shows banners for it).
+    let phone = match origin {
+        Origin::Continue { pc: true } => crate::phone::answers_cards(shared),
+        _ => true,
+    };
+    let say = |html: &str| if phone { send(shared, html, &[]) } else { None };
     // An elevated overlay would hand its administrator token to the run.
     if crate::win::is_elevated() {
         util::log_line(&["remote-refused", "elevated"]);
-        send(shared, x.elevated, &[]);
-        return;
+        say(x.elevated);
+        return Start::Refused(x.elevated.to_string());
     }
     if shared.remote.lock().unwrap().running.is_some() {
-        send(shared, x.busy, &[]);
-        return;
+        if origin == Origin::Phone {
+            send(shared, x.busy, &[]);
+        }
+        return Start::Busy;
     }
     let cfg = shared.cfg();
     let (cwd, project, resume_id) = match &target {
@@ -1290,25 +1460,36 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
     // The working directory must be a known project, whatever the menus said earlier.
     if !is_known_project(&cfg, &cwd) {
         util::log_line(&["remote-refused", "unknown project", &project]);
-        send(shared, x.no_projects, &[]);
-        return;
+        say(x.no_projects);
+        return Start::Refused(x.no_projects.to_string());
+    }
+    // Never read as an option (a session id comes from hooks and state.json).
+    if resume_id.as_deref().is_some_and(|id| !valid_session_id(id)) {
+        util::log_line(&["remote-refused", "bad session id", &project]);
+        say(x.no_sessions);
+        return Start::Refused(x.no_sessions.to_string());
     }
     let Some(exe) = claude_path(&cfg) else {
-        send(shared, x.claude_missing, &[]);
-        return;
+        say(x.claude_missing);
+        return Start::Refused(x.claude_missing.to_string());
     };
     let wanted = config::get_str(&cfg, "remote.permissionMode").unwrap_or_else(|| "default".to_string());
-    let mode = if ALLOWED_MODES.contains(&wanted.as_str()) {
+    let mut mode = if ALLOWED_MODES.contains(&wanted.as_str()) {
         wanted
     } else {
         util::log_line(&["remote-mode-refused", &wanted, "using default"]);
         "default".to_string()
     };
+    if let Some(c) = cap {
+        let capped = stricter_mode(&mode, c);
+        if capped != mode {
+            util::log_line(&["remote-mode-capped", &mode, &capped]);
+            mode = capped;
+        }
+    }
     // Shown next to "working…": acceptEdits changes files without asking.
     let mode_note = if mode == "default" { String::new() } else { format!(" · <i>{}</i>", esc(&mode)) };
-    let model = config::get_str(&cfg, "remote.model")
-        .map(|m| m.trim().to_string())
-        .filter(|m| valid_model(m));
+    let model = configured_model(&cfg);
 
     let mut cmd = Command::new(&exe);
     cmd.current_dir(&cwd)
@@ -1317,7 +1498,7 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
         cmd.args(["--model", m]);
     }
     if let Some(id) = &resume_id {
-        cmd.args(["--resume", id]);
+        cmd.arg(format!("--resume={id}"));
     }
     match persistent_env() {
         // What a freshly opened terminal would get, not the environment of whichever Claude
@@ -1344,8 +1525,10 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
         let mut st = shared.remote.lock().unwrap();
         if st.running.is_some() {
             drop(st);
-            send(shared, x.busy, &[]);
-            return;
+            if origin == Origin::Phone {
+                send(shared, x.busy, &[]);
+            }
+            return Start::Busy;
         }
         st.run_seq += 1;
         let seq = st.run_seq;
@@ -1361,13 +1544,13 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
             status_mid: None,
             exited: false,
             job: None,
+            pc_continue: origin == (Origin::Continue { pc: true }),
         });
         if let Some(id) = &resume_id {
             st.session_runs.insert(id.clone(), seq);
         }
         seq
     };
-    let target_gen = shared.remote.lock().unwrap().target_gen;
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1382,8 +1565,8 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
                 }
             }
             util::log_line(&["remote-error", &e.to_string()]);
-            send(shared, &format!("{}\n<code>{}</code>", fill(x.failed, &[("p", &esc(&project))]), esc(&e.to_string())), &[]);
-            return;
+            say(&format!("{}\n<code>{}</code>", fill(x.failed, &[("p", &esc(&project))]), esc(&e.to_string())));
+            return Start::Refused(e.to_string());
         }
     };
     // Into its Job Object before it has the prompt, so it cannot start anything outside it.
@@ -1419,8 +1602,20 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
     if let Some(id) = &resume_id {
         shared.remote_sessions.lock().unwrap().insert(id.clone());
     }
-    util::log_line(&["remote-start", &project, resume_id.as_deref().unwrap_or("new")]);
-    let status_mid = send(shared, &format!("{}{mode_note}", fill(x.working, &[("p", &esc(&project))])), &[]);
+    let origin_name = match origin {
+        Origin::Phone => "phone",
+        Origin::Queued => "queued",
+        Origin::Continue { pc: false } => "continue",
+        Origin::Continue { pc: true } => "continue-pc",
+    };
+    util::log_line(&["remote-start", &project, resume_id.as_deref().unwrap_or("new"), origin_name]);
+    // A run that waited for a limit reset says so first.
+    let lead = match origin {
+        Origin::Phone => String::new(),
+        Origin::Queued => format!("{}\n", x.due_queued),
+        Origin::Continue { .. } => format!("{}\n", x.due_continue),
+    };
+    let status_mid = say(&format!("{lead}{}{mode_note}", fill(x.working, &[("p", &esc(&project))])));
     if let Some(r) = shared.remote.lock().unwrap().running.as_mut() {
         if r.seq == seq {
             r.status_mid = status_mid;
@@ -1446,6 +1641,10 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
     }
 
     let stdout = child.stdout.take();
+    let title_for_new = match &target {
+        Target::Resume { title, .. } if !title.is_empty() && origin != Origin::Phone => title.clone(),
+        _ => util::truncate(&prompt.split_whitespace().collect::<Vec<_>>().join(" "), 48),
+    };
     let ctx = Arc::new(RunCtx {
         seq,
         project: project.clone(),
@@ -1453,8 +1652,11 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
         started,
         status_mid,
         target_gen,
+        origin,
+        phone,
+        lead,
         mode_note,
-        title_for_new: util::truncate(&prompt.split_whitespace().collect::<Vec<_>>().join(" "), 48),
+        title_for_new,
         stderr_tail,
         out: std::sync::Mutex::new(RunOut { session_id: resume_id.clone(), ..RunOut::default() }),
         edit_guard: std::sync::Mutex::new(()),
@@ -1513,7 +1715,14 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
                     util::log_line(&["remote-timeout", &ctx.seq.to_string()]);
                     stop_running(&app, &shared, false);
                     let minutes = (max_ms / 60_000).to_string();
-                    send(&shared, &fill(s(&shared).timeout, &[("m", &minutes)]), &[]);
+                    let note = fill(s(&shared).timeout, &[("m", &minutes)]);
+                    if ctx.phone {
+                        send(&shared, &note, &[]);
+                    }
+                    // finalize() says nothing of a stopped run: the PC is told here.
+                    if ctx.origin == (Origin::Continue { pc: true }) {
+                        crate::schedule::pc_not_continued(&app, &shared, &ctx.project, &note);
+                    }
                     continue;
                 }
                 if result_sent || stop_requested || activity == shown || activity.is_empty() {
@@ -1535,7 +1744,8 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
                     if still {
                         let secs = (util::now_ms() - ctx.started) / 1000;
                         let html = format!(
-                            "{}{} ({secs} s)\n<i>{}</i>",
+                            "{}{}{} ({secs} s)\n<i>{}</i>",
+                            ctx.lead,
                             fill(s(&shared).working, &[("p", &esc(&ctx.project))]),
                             ctx.mode_note,
                             esc(&activity)
@@ -1556,6 +1766,18 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
         if let Some(out) = stdout {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+                // A used-up usage limit (its StopFailure hook is left to this reader).
+                let limit = crate::limits::from_stream(&v);
+                if let Some(hit) = &limit {
+                    let waiter = crate::limits::Waiter {
+                        session_id: ctx.out.lock().unwrap().session_id.clone().unwrap_or_default(),
+                        cwd: ctx.cwd.clone(),
+                        entrypoint: "remote".to_string(),
+                        at_ms: util::now_ms(),
+                        ..crate::limits::Waiter::default()
+                    };
+                    crate::limits::record_hit(&app, &shared, hit.clone(), Some(waiter), "remote");
+                }
                 match v.get("type").and_then(Value::as_str).unwrap_or("") {
                     "system" if v.get("subtype").and_then(Value::as_str) == Some("init") => {
                         if let Some(id) = v.get("session_id").and_then(Value::as_str) {
@@ -1571,6 +1793,8 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
                         }
                     }
                     "assistant" if v.get("parent_tool_use_id").map(Value::is_null).unwrap_or(true) => {
+                        // Is the newest message the limit's error (or was it followed by more)?
+                        ctx.out.lock().unwrap().limit_msg = limit.clone();
                         if let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) {
                             for b in blocks {
                                 if let Some(a) = activity_line(b) {
@@ -1589,8 +1813,27 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
                             }
                         }
                     }
-                    "rate_limit_event" => feed_rate_limits(&app, &shared, &v),
+                    "rate_limit_event" => {
+                        feed_rate_limits(&app, &shared, &v);
+                        if limit.is_some() {
+                            ctx.out.lock().unwrap().limit_info = limit.clone();
+                        }
+                    }
                     "result" => {
+                        // The run ended because the usage limit ran out: its continue at the
+                        // reset is planned in finalize.
+                        {
+                            let mut o = ctx.out.lock().unwrap();
+                            let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                            let ended = limit.clone().or_else(|| if is_error { o.limit_msg.clone() } else { None });
+                            o.limit = ended.map(|mut h| {
+                                if let (None, Some(info)) = (h.resets_at, &o.limit_info) {
+                                    h.resets_at = info.resets_at;
+                                    h.reset_exact = info.reset_exact;
+                                }
+                                h
+                            });
+                        }
                         // Mark it before waiting for the guard, so a waiter-side finalize waits
                         // for this report instead of declaring the run failed.
                         let first = {
@@ -1628,6 +1871,7 @@ pub fn start_run(app: &AppHandle, shared: &Arc<Shared>, target: Target, prompt: 
         }
         finalize(&app, &shared, &ctx);
     });
+    Start::Started
 }
 
 /// Fixed facts about one run, shared by its reader, waiter and ticker threads.
@@ -1637,7 +1881,13 @@ struct RunCtx {
     cwd: String,
     started: i64,
     status_mid: Option<i64>,
-    target_gen: u64,
+    /// The phone's target generation when the run started (None: the run never moves the target).
+    target_gen: Option<u64>,
+    origin: Origin,
+    /// It reports to the paired chat.
+    phone: bool,
+    /// The first line of its status message ("The limit reset: …"), or empty.
+    lead: String,
     /// " · <i>plan</i>" etc. after "working…" when the mode is not the default.
     mode_note: String,
     title_for_new: String,
@@ -1659,6 +1909,12 @@ struct RunOut {
     ok: bool,
     last_text: String,
     finalized: bool,
+    /// The newest top-level message was the usage limit's error.
+    limit_msg: Option<crate::limits::Hit>,
+    /// The last rejected rate-limit report (its reset).
+    limit_info: Option<crate::limits::Hit>,
+    /// The run ended because the usage limit ran out.
+    limit: Option<crate::limits::Hit>,
 }
 
 /// The result line arrived: final status edit and the answer itself.
@@ -1683,6 +1939,9 @@ fn report(shared: &Arc<Shared>, ctx: &RunCtx, r: &Value) {
     if body.trim().is_empty() {
         body = last_text;
     }
+    if !ctx.phone {
+        return;
+    }
     let chunks = escaped_chunks(&body);
     let total = chunks.len();
     for (i, c) in chunks.into_iter().take(4).enumerate() {
@@ -1697,7 +1956,7 @@ fn report(shared: &Arc<Shared>, ctx: &RunCtx, r: &Value) {
 
 /// End of a run (stdout EOF, or shortly after the process exited). Runs once.
 fn finalize(app: &AppHandle, shared: &Arc<Shared>, ctx: &RunCtx) {
-    let _g = ctx.edit_guard.lock().unwrap();
+    let guard = ctx.edit_guard.lock().unwrap();
     let (session_id, reported, ok, last_text, report_ran) = {
         let mut o = ctx.out.lock().unwrap();
         if o.finalized {
@@ -1733,12 +1992,13 @@ fn finalize(app: &AppHandle, shared: &Arc<Shared>, ctx: &RunCtx) {
             let html = format!("{}\n<code>{}</code>", fill(x.failed, &[("p", &esc(&ctx.project))]), body);
             match ctx.status_mid {
                 Some(mid) => telegram::edit(shared, mid, &html),
-                None => {
+                None if ctx.phone => {
                     send(shared, &html, &[]);
                 }
+                None => {}
             }
         }
-    } else if ok && !stop_requested {
+    } else if ok && !stop_requested && ctx.phone && ctx.target_gen.is_some() {
         send(shared, &format!("<i>{}</i>", x.reply_hint), &[]);
     }
 
@@ -1749,16 +2009,18 @@ fn finalize(app: &AppHandle, shared: &Arc<Shared>, ctx: &RunCtx) {
 
     // The next message continues this session, unless the user picked something else while
     // the run was going.
+    let mut title = ctx.title_for_new.clone();
     {
         let mut st = shared.remote.lock().unwrap();
         if let Some(id) = &session_id {
             st.own_runs.insert(id.clone(), util::now_ms());
-            if st.target_gen == ctx.target_gen {
-                let title = match &st.target {
-                    Some(Target::Resume { id: tid, title, .. }) if tid == id => title.clone(),
-                    _ => ctx.title_for_new.clone(),
-                };
-                st.target = Some(Target::Resume { id: id.clone(), cwd: ctx.cwd.clone(), project: ctx.project.clone(), title });
+            if let Some(Target::Resume { id: tid, title: t, .. }) = &st.target {
+                if tid == id {
+                    title = t.clone();
+                }
+            }
+            if ctx.target_gen == Some(st.target_gen) {
+                st.target = Some(Target::Resume { id: id.clone(), cwd: ctx.cwd.clone(), project: ctx.project.clone(), title: title.clone() });
             }
         }
         if st.running.as_ref().map(|r| r.seq == ctx.seq).unwrap_or(false) {
@@ -1767,6 +2029,27 @@ fn finalize(app: &AppHandle, shared: &Arc<Shared>, ctx: &RunCtx) {
         st.last_touch_ms = util::now_ms();
     }
     util::log_line(&["remote-end", &ctx.project, session_id.as_deref().unwrap_or("-")]);
+    drop(guard);
+
+    // Ended because the usage limit ran out: continued at the reset, but a continue never
+    // continues itself again (no chain of resets without a new message from the user).
+    let limit = ctx.out.lock().unwrap().limit.clone();
+    match (limit, &session_id) {
+        (Some(_), _) if stop_requested => {}
+        (Some(_), _) if matches!(ctx.origin, Origin::Continue { .. }) => {
+            util::log_line(&["schedule", "limit-again", &ctx.project]);
+            if ctx.phone {
+                send(shared, crate::schedule::s(shared).again, &[]);
+            }
+        }
+        (Some(hit), Some(id)) => crate::schedule::after_remote_limit(shared, id, &ctx.cwd, &ctx.project, &title, &hit),
+        _ => {}
+    }
+    // A session continued for the PC that did not get an answer: the PC is told.
+    if ctx.origin == (Origin::Continue { pc: true }) && !stop_requested && (!reported || !ok) {
+        let detail = if reported { String::new() } else { util::truncate(ctx.stderr_tail.lock().unwrap().trim(), 160) };
+        crate::schedule::pc_not_continued(app, shared, &ctx.project, &detail);
+    }
 
     // Hooks of this session keep being treated as remote for a little while, unless a newer
     // run on the same session has started meanwhile (that run owns the entry).
@@ -1824,6 +2107,22 @@ mod tests {
         assert!(!path.contains('%'), "unexpanded: {path}");
         assert_ne!(env_get(&env, "USERNAME").map(str::to_uppercase).as_deref(), Some("SYSTEM"));
         assert!(env_get(&env, "SystemRoot").is_some());
+    }
+
+    #[test]
+    fn continue_mode_is_capped_and_ids_are_never_options() {
+        assert_eq!(stricter_mode("acceptEdits", "plan"), "plan");
+        assert_eq!(stricter_mode("acceptEdits", "default"), "default");
+        assert_eq!(stricter_mode("acceptEdits", "acceptEdits"), "acceptEdits");
+        assert_eq!(stricter_mode("plan", "acceptEdits"), "plan");
+        // Not known, or a mode a run never gets: default.
+        assert_eq!(stricter_mode("acceptEdits", ""), "default");
+        assert_eq!(stricter_mode("acceptEdits", "bypassPermissions"), "default");
+        assert_eq!(stricter_mode("acceptEdits", "auto"), "default");
+        assert!(valid_session_id("0b7d2f3e-1c2a-4f5e-9a8b-123456789abc"));
+        for bad in ["", "-x", "--permission-mode=bypassPermissions", "a b", "a/b", "a=b"] {
+            assert!(!valid_session_id(bad), "{bad}");
+        }
     }
 
     #[test]
