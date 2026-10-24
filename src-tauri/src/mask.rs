@@ -419,18 +419,20 @@ mod tests {
         assert_eq!(secrets(input), input);
     }
 
+    /// The fake credentials below are split with `concat!` so that secret scanners (GitHub's
+    /// among them) do not report test fixtures as leaked keys. None of them is real.
     #[test]
     fn known_prefixes() {
-        masked("export X=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv", "AbCdEfGhIjKlMnOp");
-        masked("key sk-proj-1234567890abcdefXYZ done", "1234567890abcdef");
-        masked("git clone https://ghp_abcdefghijklmnopqrstuvwxyz0123456789@github.com/x/y", "abcdefghijklmnop");
-        masked("github_pat_11ABCDEFG0123456789_abcdefghijklmnop", "11ABCDEFG012345");
-        masked("glpat-abcdefghijklmnopqrst", "abcdefghijklmnop");
-        masked("xoxb-1234567890-abcdefghijkl", "1234567890-abcd");
-        masked("aws AKIAIOSFODNN7EXAMPLE x", "IOSFODNN7EXAMPLE");
-        masked("AIzaSyA-abcdefghijklmnopqrstuvwxyz12345", "abcdefghijklmnop");
-        masked("bot 123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw-x", "AAHdqTcvCH1vGWJx");
-        masked("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U", "eyJzdWIiOiIxMjM0");
+        masked(concat!("export X=sk-", "ant-api03-AbCdEfGhIjKlMnOpQrStUv"), "AbCdEfGhIjKlMnOp");
+        masked(concat!("key sk-", "proj-1234567890abcdefXYZ done"), "1234567890abcdef");
+        masked(concat!("git clone https://gh", "p_abcdefghijklmnopqrstuvwxyz0123456789@github.com/x/y"), "abcdefghijklmnop");
+        masked(concat!("github_", "pat_11ABCDEFG0123456789_abcdefghijklmnop"), "11ABCDEFG012345");
+        masked(concat!("gl", "pat-abcdefghijklmnopqrst"), "abcdefghijklmnop");
+        masked(concat!("xo", "xb-1234567890-abcdefghijkl"), "1234567890-abcd");
+        masked(concat!("aws AK", "IAIOSFODNN7EXAMPLE x"), "IOSFODNN7EXAMPLE");
+        masked(concat!("AI", "zaSyA-abcdefghijklmnopqrstuvwxyz12345"), "abcdefghijklmnop");
+        masked(concat!("bot 123456789:", "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw-x"), "AAHdqTcvCH1vGWJx");
+        masked(concat!("jwt eyJhbGciOiJIUzI1NiJ9.", "eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"), "eyJzdWIiOiIxMjM0");
     }
 
     #[test]
